@@ -52,10 +52,11 @@ jobs:
       - name: Regenerate .SRCINFO (needs makepkg, run in Arch container)
         if: steps.check.outputs.changed == 'true'
         run: |
-          docker run --rm -v "$PWD":/repo -w /repo archlinux:base-devel bash -c "
-            useradd -m builder && chown -R builder:builder /repo &&
-            su builder -c 'makepkg --printsrcinfo > .SRCINFO'
-          "
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD":/repo -w /repo \
+            archlinux:base-devel \
+            bash -c "export HOME=/tmp; makepkg --printsrcinfo > .SRCINFO"
 
       - name: Commit changes to GitHub
         if: steps.check.outputs.changed == 'true'
