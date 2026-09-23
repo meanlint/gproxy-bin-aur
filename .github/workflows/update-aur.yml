@@ -1,0 +1,95 @@
+name: Update gproxy-bin and push to AUR
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch latest gproxy release
+        id: rel
+        run: |
+          data=$(curl -sL https://api.github.com/repos/LeenHawk/gproxy/releases/latest)
+          ver=$(echo "$data" | jq -r '.tag_name' | sed 's/^v//')
+          x86_sha=$(echo "$data" | jq -r '.assets[] | select(.name=="gproxy-linux-x86_64.zip") | .digest' | sed 's/^sha256://')
+          aarch64_sha=$(echo "$data" | jq -r '.assets[] | select(.name=="gproxy-linux-aarch64.zip") | .digest' | sed 's/^sha256://')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "x86_64_sha=$x86_sha" >> "$GITHUB_OUTPUT"
+          echo "aarch64_sha=$aarch64_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the package already exists on AUR
+        id: aur
+        run: |
+          count=$(curl -s "https://aur.archlinux.org/rpc/v5/info/gproxy-bin" | jq -r '.resultcount')
+          echo "exists=$([ "$count" != "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether a push is needed
+        id: check
+        run: |
+          current=$(grep -Po '(?<=^pkgver=).*' PKGBUILD)
+          if [ "$current" != "${{ steps.rel.outputs.version }}" ] || [ "${{ steps.aur.outputs.exists }}" = "false" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump PKGBUILD
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.rel.outputs.version }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${{ steps.rel.outputs.x86_64_sha }}')/" PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${{ steps.rel.outputs.aarch64_sha }}')/" PKGBUILD
+
+      - name: Regenerate .SRCINFO (needs makepkg, run in Arch container)
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo archlinux:base-devel bash -c "
+            useradd -m builder && chown -R builder:builder /repo &&
+            su builder -c 'makepkg --printsrcinfo > .SRCINFO'
+          "
+
+      - name: Commit changes to GitHub
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git config user.name "gproxy-bin-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "no PKGBUILD/.SRCINFO changes to commit (first AUR submission of an already-current version)"
+          else
+            git commit -m "chore: bump gproxy-bin to ${{ steps.rel.outputs.version }}"
+            git push origin HEAD:main
+          fi
+
+      - name: Push to AUR
+        if: steps.check.outputs.changed == 'true'
+        env:
+          SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+
+          git clone ssh://aur@aur.archlinux.org/gproxy-bin.git aur-repo
+          cp PKGBUILD .SRCINFO gproxy.service gproxy.env gproxy-bin.install aur-repo/
+          cd aur-repo
+          git checkout -B master
+          git config user.name "gproxy-bin-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing to push"
+            exit 0
+          fi
+          git commit -m "gproxy-bin ${{ steps.rel.outputs.version }}"
+          git push origin master
