@@ -3,7 +3,12 @@ name: Update gproxy-bin and push to AUR
 on:
   schedule:
     - cron: '17 */6 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force pkgrel bump and push to AUR'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -17,35 +22,71 @@ jobs:
       - name: Fetch latest gproxy release
         id: rel
         run: |
-          data=$(curl -sL https://api.github.com/repos/LeenHawk/gproxy/releases/latest)
+          data=$(curl -sfL -H "Authorization: Bearer ${{ github.token }}" \
+            https://api.github.com/repos/LeenHawk/gproxy/releases/latest)
           ver=$(echo "$data" | jq -r '.tag_name' | sed 's/^v//')
           x86_sha=$(echo "$data" | jq -r '.assets[] | select(.name=="gproxy-linux-x86_64.zip") | .digest' | sed 's/^sha256://')
           aarch64_sha=$(echo "$data" | jq -r '.assets[] | select(.name=="gproxy-linux-aarch64.zip") | .digest' | sed 's/^sha256://')
+
+          # Refuse to continue on bad data (rate limit, missing digest, ...)
+          if [ -z "$ver" ] || [ "$ver" = "null" ]; then
+            echo "::error::failed to read release version"; exit 1
+          fi
+          for s in "$x86_sha" "$aarch64_sha"; do
+            if ! [[ "$s" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid sha256 '$s'"; exit 1
+            fi
+          done
+
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "x86_64_sha=$x86_sha" >> "$GITHUB_OUTPUT"
           echo "aarch64_sha=$aarch64_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Check whether the package already exists on AUR
+      - name: Query AUR
         id: aur
         run: |
-          count=$(curl -s "https://aur.archlinux.org/rpc/v5/info/gproxy-bin" | jq -r '.resultcount')
+          info=$(curl -s "https://aur.archlinux.org/rpc/v5/info/gproxy-bin")
+          count=$(echo "$info" | jq -r '.resultcount')
+          aur_ver=$(echo "$info" | jq -r '.results[0].Version // ""')
           echo "exists=$([ "$count" != "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "version=$aur_ver" >> "$GITHUB_OUTPUT"
 
       - name: Decide whether a push is needed
         id: check
         run: |
-          current=$(grep -Po '(?<=^pkgver=).*' PKGBUILD)
-          if [ "$current" != "${{ steps.rel.outputs.version }}" ] || [ "${{ steps.aur.outputs.exists }}" = "false" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          cur_ver=$(grep -Po '(?<=^pkgver=).*' PKGBUILD)
+          cur_rel=$(grep -Po '(?<=^pkgrel=).*' PKGBUILD)
+          cur_x86=$(grep -Po "(?<=^sha256sums_x86_64=\(')[0-9a-f]+" PKGBUILD || true)
+          cur_arm=$(grep -Po "(?<=^sha256sums_aarch64=\(')[0-9a-f]+" PKGBUILD || true)
+
+          new_ver="${{ steps.rel.outputs.version }}"
+          changed=false
+          rel="$cur_rel"
+
+          if [ "$cur_ver" != "$new_ver" ]; then
+            echo "new upstream version: $cur_ver -> $new_ver"
+            rel=1; changed=true
+          elif [ "$cur_x86" != "${{ steps.rel.outputs.x86_64_sha }}" ] || \
+               [ "$cur_arm" != "${{ steps.rel.outputs.aarch64_sha }}" ]; then
+            echo "same version but sha256 changed upstream, bumping pkgrel"
+            rel=$((cur_rel + 1)); changed=true
+          elif [ "${{ inputs.force }}" = "true" ]; then
+            echo "forced run, bumping pkgrel"
+            rel=$((cur_rel + 1)); changed=true
+          elif [ "${{ steps.aur.outputs.exists }}" = "false" ] || \
+               [ "${{ steps.aur.outputs.version }}" != "${cur_ver}-${cur_rel}" ]; then
+            echo "AUR (${{ steps.aur.outputs.version }}) out of sync with repo (${cur_ver}-${cur_rel})"
+            changed=true
           fi
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$rel" >> "$GITHUB_OUTPUT"
 
       - name: Bump PKGBUILD
         if: steps.check.outputs.changed == 'true'
         run: |
           sed -i "s/^pkgver=.*/pkgver=${{ steps.rel.outputs.version }}/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=${{ steps.check.outputs.pkgrel }}/" PKGBUILD
           sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${{ steps.rel.outputs.x86_64_sha }}')/" PKGBUILD
           sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${{ steps.rel.outputs.aarch64_sha }}')/" PKGBUILD
 
@@ -65,9 +106,9 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add PKGBUILD .SRCINFO
           if git diff --cached --quiet; then
-            echo "no PKGBUILD/.SRCINFO changes to commit (first AUR submission of an already-current version)"
+            echo "no PKGBUILD/.SRCINFO changes to commit"
           else
-            git commit -m "chore: bump gproxy-bin to ${{ steps.rel.outputs.version }}"
+            git commit -m "chore: bump gproxy-bin to ${{ steps.rel.outputs.version }}-${{ steps.check.outputs.pkgrel }}"
             git push origin HEAD:main
           fi
 
@@ -92,5 +133,5 @@ jobs:
             echo "nothing to push"
             exit 0
           fi
-          git commit -m "gproxy-bin ${{ steps.rel.outputs.version }}"
+          git commit -m "gproxy-bin ${{ steps.rel.outputs.version }}-${{ steps.check.outputs.pkgrel }}"
           git push origin master
